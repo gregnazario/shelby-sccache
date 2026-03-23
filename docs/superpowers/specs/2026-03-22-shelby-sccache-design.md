@@ -108,10 +108,10 @@ sccache GET /bucket/sccache/v1/<key>
 shelby-cache-proxy receives S3 GetObject
     │
     ├─ 1. Check local disk cache (~/.shelby-cache/objects/<key>)
-    │     ├─ HIT: Return file contents immediately, update LRU timestamp
+    │     ├─ HIT: Return file contents, update LRU timestamp + key_map.last_accessed
     │     └─ MISS: Continue
     ├─ 2. Download from Shelby via SDK (path: sccache/v1/<key>)
-    │     ├─ FOUND: Write to local cache (temp → rename), return contents
+    │     ├─ FOUND: Write to local cache (temp → rename), update key_map.last_accessed, return contents
     │     ├─ NOT FOUND: Return 404
     │     └─ ERROR: Return 404, log error (sccache will recompile)
     └─ 3. Return response
@@ -155,14 +155,15 @@ shelby-cache-proxy receives S3 GetObject
   );
 
   CREATE TABLE key_map (
-    cache_key    TEXT PRIMARY KEY,  -- sccache S3 object key
-    content_hash TEXT NOT NULL,     -- FK to blobs.content_hash
-    created_at   INTEGER NOT NULL
+    cache_key     TEXT PRIMARY KEY,  -- sccache S3 object key
+    content_hash  TEXT NOT NULL,     -- FK to blobs.content_hash
+    created_at    INTEGER NOT NULL,
+    last_accessed INTEGER NOT NULL   -- unix timestamp, updated on every GET hit
   );
   ```
 - **Schema migrations:** The proxy checks `PRAGMA user_version` on startup and runs migrations if the schema version is behind the expected version. This handles upgrades gracefully.
 - **Bloom filter:** In-memory bloom filter (~1MB for 1M entries at 1% FPR) for fast negative lookups before hitting SQLite. On startup, the bloom filter is rebuilt by scanning all `content_hash` values from the `blobs` table (takes ~1-2 seconds for 1M entries). If startup time becomes a concern, the bloom filter can be persisted to `~/.shelby-cache/bloom.bin` and reloaded.
-- **Blob expiration tracking:** A background job runs every 6 hours, scanning the `blobs` table for entries where `shelby_expires_at` is within 5 days. For actively-used blobs (referenced by `key_map` entries accessed in the last 7 days), the proxy re-uploads them to Shelby to renew the expiration. Expired and unreferenced blobs are purged from the dedup DB.
+- **Blob expiration tracking:** A background job runs every 6 hours, scanning the `blobs` table for entries where `shelby_expires_at` is within `renewal_threshold_days` (configurable, default 5). For actively-used blobs (referenced by `key_map` entries where `last_accessed` is within the last 7 days), the proxy re-uploads them to Shelby using the same `shelby_path`, then updates `shelby_expires_at` in the `blobs` table. Expired and unreferenced blobs are purged from the dedup DB.
 - **Dedup scope by deployment mode:**
   - **Local mode (Mode 1):** Dedup only prevents the *same developer* from re-uploading identical artifacts (e.g., after a local cache eviction + rebuild). Cross-developer dedup does not apply since each developer has their own `dedup.db`.
   - **Shared server mode (Mode 2):** The dedup DB is shared across all users, providing true cross-developer dedup. This is where the >25% upload savings target applies.
@@ -227,6 +228,7 @@ s3:
 cache:
   enabled: true
   dir: ~/.shelby-cache/objects
+  staging_dir: ~/.shelby-cache/staging   # temp dir for multipart upload assembly
   max_size_gb: 10
   ttl_days: 7
   cleanup_interval_minutes: 10
@@ -236,6 +238,7 @@ dedup:
   db_path: ~/.shelby-cache/dedup.db
   bloom_filter_expected_items: 1000000
   bloom_filter_fpr: 0.01
+  renewal_threshold_days: 5              # renew blobs within this many days of expiry
 
 logging:
   level: info   # debug | info | warn | error
@@ -437,7 +440,8 @@ shelby-sccache/
 │   ├── proxy/
 │   │   ├── server.ts              # Bun HTTP server, S3 route handling
 │   │   ├── s3-auth.ts             # SigV4 signature validation
-│   │   ├── s3-handlers.ts         # PutObject, GetObject, HeadObject handlers
+│   │   ├── s3-handlers.ts         # PutObject, GetObject, HeadObject, ListObjects, DeleteObject
+│   │   ├── s3-multipart.ts        # CreateMultipartUpload, UploadPart, CompleteMultipartUpload, AbortMultipartUpload
 │   │   └── s3-xml.ts              # S3 XML response formatting
 │   ├── cache/
 │   │   ├── disk-cache.ts          # LRU read-through disk cache

@@ -8,6 +8,7 @@ import { S3Handlers } from "./s3-handlers";
 import { MultipartManager } from "./s3-multipart";
 import { createS3Router } from "./s3-router";
 import { s3AuthMiddleware } from "./s3-auth";
+import { RenewalJob } from "../background/renewal";
 import type { ProxyConfig } from "../types";
 
 export function createServer(config: ProxyConfig) {
@@ -93,8 +94,10 @@ export function createServer(config: ProxyConfig) {
   const s3Router = createS3Router(s3Handlers, multipartManager);
   app.route("/", s3Router);
 
-  // Start background cleaner
+  // Start background jobs
   cacheCleaner.start();
+  const renewalJob = new RenewalJob(dedupStore, shelbyClient, config.dedup.renewalThresholdDays);
+  renewalJob.start();
 
   return {
     app,
@@ -102,6 +105,7 @@ export function createServer(config: ProxyConfig) {
     hostname: config.server.host,
     cleanup: () => {
       cacheCleaner.stop();
+      renewalJob.stop();
       s3Handlers.close();
     },
   };

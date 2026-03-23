@@ -1,0 +1,50 @@
+name: 'Shelby Build Cache'
+description: 'Set up sccache with Shelby decentralized storage'
+inputs:
+  aptos-private-key:
+    description: 'Aptos Ed25519 private key'
+    required: true
+  shelby-api-key:
+    description: 'Shelby API key'
+    required: true
+  network:
+    description: 'Shelby network (shelbynet, testnet)'
+    required: false
+    default: 'shelbynet'
+  cache-size-gb:
+    description: 'Local cache size in GB'
+    required: false
+    default: '5'
+  port:
+    description: 'Proxy port'
+    required: false
+    default: '9000'
+runs:
+  using: 'composite'
+  steps:
+    - name: Install Bun
+      uses: oven-sh/setup-bun@v2
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.6
+    - name: Start Shelby Cache Proxy
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}/..
+        bun install --frozen-lockfile
+        APTOS_PRIVATE_KEY=${{ inputs.aptos-private-key }} \
+        SHELBY_API_KEY=${{ inputs.shelby-api-key }} \
+        SHELBY_CACHE_SERVER_PORT=${{ inputs.port }} \
+        SHELBY_CACHE_CACHE_MAX_SIZE_GB=${{ inputs.cache-size-gb }} \
+        bun run src/cli/index.ts start &
+        sleep 2  # Wait for server to start
+    - name: Configure sccache
+      shell: bash
+      run: |
+        echo "SCCACHE_BUCKET=shelby" >> $GITHUB_ENV
+        echo "SCCACHE_ENDPOINT=http://localhost:${{ inputs.port }}" >> $GITHUB_ENV
+        echo "SCCACHE_REGION=shelbyland" >> $GITHUB_ENV
+        echo "SCCACHE_S3_USE_SSL=false" >> $GITHUB_ENV
+        echo "SCCACHE_S3_NO_CREDENTIALS=false" >> $GITHUB_ENV
+        echo "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE" >> $GITHUB_ENV
+        echo "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" >> $GITHUB_ENV
+        echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV

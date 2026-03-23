@@ -65,11 +65,21 @@ A TypeScript/Bun HTTP server implementing a minimal S3-compatible API surface �
 
 | S3 Operation | sccache Usage | Implementation |
 |---|---|---|
-| `PutObject` | Store compiled artifact | Content-hash dedup check → upload to Shelby → write local cache |
+| `PutObject` | Store compiled artifact (< 5MB) | Content-hash dedup check → upload to Shelby → write local cache |
+| `CreateMultipartUpload` | Initiate large artifact upload (≥ 5MB) | Return upload ID, create temp staging dir |
+| `UploadPart` | Stream part of large artifact | Buffer part to temp staging dir |
+| `CompleteMultipartUpload` | Finalize large artifact | Assemble parts → dedup check → upload to Shelby → write local cache |
+| `AbortMultipartUpload` | Cancel failed upload | Clean up temp staging dir |
 | `GetObject` | Retrieve cached artifact | Local cache check → Shelby download → cache + return |
 | `HeadObject` | Check if cache key exists | Bloom filter → local cache → Shelby HEAD |
-| `ListObjectsV2` | (Unused by sccache) | No-op / empty response |
-| `DeleteObject` | (Unused by sccache) | Optional no-op |
+| `ListObjectsV2` | `sccache --show-stats` / cleanup | Return valid empty XML: `<ListBucketResult><Contents/></ListBucketResult>` |
+| `DeleteObject` | (Unused by sccache) | Return 204 No Content (no-op; Shelby blob expiration handles cleanup) |
+
+**Note on multipart uploads:** sccache uses OpenDAL under the hood, which defaults to multipart upload for objects exceeding ~5MB. Since Rust/C++ artifacts commonly exceed this threshold, multipart is a common-path requirement. The proxy buffers parts in a temp directory (`~/.shelby-cache/staging/<upload-id>/`) and assembles them before hashing and uploading to Shelby as a single blob.
+
+#### Prerequisite: S3 API Surface Validation
+
+Before implementation, run sccache against a request-logging proxy (simple Bun server that logs all incoming requests) to empirically capture the exact S3 operations sccache/OpenDAL sends. This validates the API surface table above and catches any additional operations needed (e.g., presigned URLs, chunked transfer encoding).
 
 #### Request Flow: PUT (Cache Store)
 
@@ -83,10 +93,10 @@ shelby-cache-proxy receives S3 PutObject
     ├─ 2. Check dedup index (SQLite): hash exists?
     │     ├─ YES: Record key→existing_blob_path mapping, skip upload, return 200
     │     └─ NO: Continue
-    ├─ 3. Upload blob to Shelby via SDK (path: sccache/v1/<key>)
-    ├─ 4. Write body to local disk cache (~/.shelby-cache/objects/<key>)
+    ├─ 3. Write body to local disk cache (temp file → atomic rename to ~/.shelby-cache/objects/<key>)
+    ├─ 4. Upload blob to Shelby via SDK (path: sccache/v1/<key>) — async with retries
     ├─ 5. Record content_hash → blob_path in dedup SQLite
-    └─ 6. Return 200 OK
+    └─ 6. Return 200 OK (immediately after local cache write; Shelby upload continues async)
 ```
 
 #### Request Flow: GET (Cache Retrieve)
@@ -101,17 +111,26 @@ shelby-cache-proxy receives S3 GetObject
     │     ├─ HIT: Return file contents immediately, update LRU timestamp
     │     └─ MISS: Continue
     ├─ 2. Download from Shelby via SDK (path: sccache/v1/<key>)
-    │     ├─ FOUND: Write to local cache, return contents
-    │     └─ NOT FOUND: Return 404
+    │     ├─ FOUND: Write to local cache (temp → rename), return contents
+    │     ├─ NOT FOUND: Return 404
+    │     └─ ERROR: Return 404, log error (sccache will recompile)
     └─ 3. Return response
 ```
+
+#### Error Handling & Retry Strategy
+
+- **PUT failure policy:** Write to local disk cache immediately, return 200 to sccache. Upload to Shelby asynchronously with retries. If Shelby upload fails after all retries, the artifact is still in local cache and will be retried on the next PUT for the same key.
+- **GET failure policy:** If Shelby download fails (network error, timeout), return 404. sccache will recompile the artifact. Log the failure with request ID and error details.
+- **Retry strategy:** 3 retries with exponential backoff (1s, 2s, 4s) for transient Shelby errors (network timeouts, 5xx responses).
+- **Circuit breaker:** If Shelby returns errors for >50% of requests in a 5-minute window, degrade to local-only cache mode. Log a warning. Re-check Shelby health every 60 seconds and resume when healthy.
+- **Stale dedup recovery:** If a GET to Shelby returns 404 for a blob that the dedup DB says should exist (expired or deleted), remove the stale entry from the dedup DB and bloom filter. Log this as a dedup reconciliation event.
 
 ### 2. Read-Through Disk Cache (Layer B)
 
 **Purpose:** Avoid redundant Shelby network fetches for recently-used artifacts.
 
 - **Location:** `~/.shelby-cache/objects/` (configurable)
-- **Key mapping:** S3 object path → filesystem path (URL-safe encoding)
+- **Key mapping:** S3 object path maps directly to filesystem path structure. For example, S3 key `sccache/v1/abc123` maps to `~/.shelby-cache/objects/sccache/v1/abc123`. Path separators (`/`) create subdirectories, which preserves debuggability.
 - **Eviction:** LRU by access time, configurable max size (default 10GB)
 - **TTL:** Configurable per-entry (default 7 days); Shelby blobs expire at 30 days
 - **Metadata:** Each cached file has a companion `.meta` JSON file with: `size`, `content_hash`, `cached_at`, `last_accessed`, `shelby_blob_path`
@@ -124,11 +143,15 @@ shelby-cache-proxy receives S3 GetObject
 - **Storage:** SQLite database at `~/.shelby-cache/dedup.db`
 - **Schema:**
   ```sql
+  -- Schema version tracking
+  PRAGMA user_version = 1;
+
   CREATE TABLE blobs (
-    content_hash TEXT PRIMARY KEY,  -- SHA-256 of artifact bytes
-    shelby_path  TEXT NOT NULL,     -- path in Shelby storage
-    size_bytes   INTEGER NOT NULL,
-    created_at   INTEGER NOT NULL   -- unix timestamp
+    content_hash    TEXT PRIMARY KEY,  -- SHA-256 of artifact bytes
+    shelby_path     TEXT NOT NULL,     -- path in Shelby storage
+    size_bytes      INTEGER NOT NULL,
+    created_at      INTEGER NOT NULL,  -- unix timestamp (when recorded in DB)
+    shelby_expires_at INTEGER NOT NULL -- unix timestamp (created_at + blob_expiry_days)
   );
 
   CREATE TABLE key_map (
@@ -137,17 +160,49 @@ shelby-cache-proxy receives S3 GetObject
     created_at   INTEGER NOT NULL
   );
   ```
-- **Bloom filter:** In-memory bloom filter (~1MB for 1M entries at 1% FPR) for fast negative lookups before hitting SQLite
-- **Shared mode:** In shared server deployments, the dedup DB is shared across all users, maximizing dedup savings
+- **Schema migrations:** The proxy checks `PRAGMA user_version` on startup and runs migrations if the schema version is behind the expected version. This handles upgrades gracefully.
+- **Bloom filter:** In-memory bloom filter (~1MB for 1M entries at 1% FPR) for fast negative lookups before hitting SQLite. On startup, the bloom filter is rebuilt by scanning all `content_hash` values from the `blobs` table (takes ~1-2 seconds for 1M entries). If startup time becomes a concern, the bloom filter can be persisted to `~/.shelby-cache/bloom.bin` and reloaded.
+- **Blob expiration tracking:** A background job runs every 6 hours, scanning the `blobs` table for entries where `shelby_expires_at` is within 5 days. For actively-used blobs (referenced by `key_map` entries accessed in the last 7 days), the proxy re-uploads them to Shelby to renew the expiration. Expired and unreferenced blobs are purged from the dedup DB.
+- **Dedup scope by deployment mode:**
+  - **Local mode (Mode 1):** Dedup only prevents the *same developer* from re-uploading identical artifacts (e.g., after a local cache eviction + rebuild). Cross-developer dedup does not apply since each developer has their own `dedup.db`.
+  - **Shared server mode (Mode 2):** The dedup DB is shared across all users, providing true cross-developer dedup. This is where the >25% upload savings target applies.
 
 ### 4. S3 Authentication
 
-sccache uses AWS SigV4 signing for S3 requests. The proxy must validate these signatures.
+sccache uses AWS SigV4 signing for S3 requests via OpenDAL.
 
-- **Access Key / Secret Key:** Shared credentials configured in both sccache and the proxy (not real AWS creds)
-- **Default credentials:** `AKIAIOSFODNN7EXAMPLE` / `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` (matching Shelby S3 Gateway defaults)
-- **Aptos signing:** The proxy holds the Aptos private key for Shelby uploads; sccache users don't need Aptos keys
-- **Team access:** Multiple API key pairs can be configured for different team members/roles
+- **Local mode (Mode 1):** Skip SigV4 validation entirely. The proxy runs on localhost and is not exposed to the network, so signature validation adds complexity without security benefit. Accept any request with valid S3 structure.
+- **Shared server mode (Mode 2):** Validate SigV4 signatures using `@smithy/signature-v4` from the AWS SDK for JS. This ensures only authorized team members can read/write the cache.
+- **Default credentials:** `AKIAIOSFODNN7EXAMPLE` / `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` (matching Shelby S3 Gateway defaults). For shared mode, `shelby-cache-proxy init` generates a random credential pair.
+- **Aptos signing:** The proxy holds the Aptos private key for Shelby uploads; sccache users don't need Aptos keys.
+- **Team access:** In shared mode, multiple API key pairs can be configured for different team members/roles.
+
+### 5. Concurrency Model
+
+Bun's HTTP server handles concurrent requests on a single JS thread with async I/O:
+
+- **SQLite writes:** Use WAL mode for concurrent read performance. Writes go through a serial queue (Bun's single-threaded JS ensures no true concurrent writes, but async overlaps are possible). `bun:sqlite` handles this natively.
+- **Disk cache writes:** Always write to a temp file (`.tmp` suffix), then atomically rename to the final path. This prevents corrupted cache entries from concurrent writes to the same key.
+- **Bloom filter:** Safe without locks since Bun executes JS on a single thread. If the process crashes mid-update, the bloom filter is rebuilt from SQLite on restart.
+- **Same-key concurrent PUT:** Last-write-wins is acceptable since sccache keys are content-addressed — concurrent writes for the same key produce identical content.
+- **Multipart staging:** Each multipart upload uses a unique upload ID, so concurrent multipart uploads don't conflict.
+
+### 6. Dependencies and SDK Requirements
+
+| Dependency | Version | Purpose |
+|---|---|---|
+| `@shelby-protocol/sdk` | latest | Blob upload, download, existence check |
+| `@aptos-labs/ts-sdk` | latest | Aptos account signing for Shelby operations |
+| `@smithy/signature-v4` | ^4.x | SigV4 validation (shared mode only) |
+| `bun:sqlite` | built-in | Dedup index, schema migrations |
+| `hono` | ^4.x | HTTP server framework with S3-compatible routing |
+
+**Shelby SDK methods required:**
+- `upload(signer, blobPath, data, options?)` — Upload blob with configurable expiration
+- `download(owner, blobPath)` — Download blob by path
+- Existence check — Either a native `head()` method or emulated via download with early abort / on-chain partition query
+
+**Note:** If the Shelby SDK does not support a native `head` or existence-check operation, the proxy will emulate it by attempting a download and immediately discarding the body after confirming the blob exists, or by querying on-chain state if available. This will be validated during the prerequisite spike.
 
 ## Configuration
 
@@ -337,7 +392,39 @@ Local Cache Size:   1.2 GB (of 10 GB limit)
 ```
 
 ### Stats Endpoint
-`GET /stats` returns detailed metrics for the benchmarking tool and monitoring dashboards.
+`GET /stats` returns detailed metrics:
+```json
+{
+  "uptime_seconds": 3600,
+  "requests": {
+    "total": 12500,
+    "put": 3200,
+    "get": 8100,
+    "head": 1200
+  },
+  "cache": {
+    "hits": 7100,
+    "misses": 1000,
+    "hit_rate": 0.876,
+    "evictions_1h": 42
+  },
+  "shelby": {
+    "uploads": 2800,
+    "downloads": 1000,
+    "upload_latency_ms": { "avg": 45, "p50": 38, "p95": 95, "p99": 120 },
+    "download_latency_ms": { "avg": 22, "p50": 18, "p95": 55, "p99": 85 },
+    "errors_1h": 3,
+    "circuit_breaker": "closed"
+  },
+  "dedup": {
+    "unique_blobs": 3102,
+    "total_keys": 4521,
+    "uploads_skipped": 1419,
+    "savings_pct": 31.4,
+    "stale_entries_reconciled": 5
+  }
+}
+```
 
 ### Structured Logging
 JSON-formatted logs with request IDs, operation types, latencies, and cache hit/miss indicators.
@@ -399,7 +486,7 @@ Using the Shelby testnet endpoints:
 - **Aptos Full Node:** Testnet endpoint (via SDK)
 - **Smart Contract:** `0xc63d6a5efb0080a6029403131715bd4971e1149f7cc099aac69bb0069b3ddbf5`
 
-**Blob expiration:** 30 days (Shelby default). The proxy will auto-renew blobs that are still in active use before expiration.
+**Blob expiration:** 30 days (Shelby default). The proxy tracks `shelby_expires_at` per blob in the dedup DB and runs a background renewal job every 6 hours to re-upload blobs approaching expiration that are still actively referenced.
 
 **Migration path:** When Shelby mainnet launches, change `network: testnet` to `network: mainnet` in config. No code changes needed.
 
@@ -414,13 +501,21 @@ Using the Shelby testnet endpoints:
 
 1. **Functional:** sccache stores/retrieves artifacts via Shelby testnet with zero sccache modifications
 2. **Performance:** Warm builds with local cache hit < 15s for a medium Rust project; Shelby-only hits add < 100ms average per artifact
-3. **Dedup:** > 25% upload savings for a team of 3+ developers working on the same project
+3. **Dedup:** > 25% upload savings in shared server mode (Mode 2) for a team of 3+ developers working on the same project. In local mode, dedup provides per-developer savings only.
 4. **Deployable:** Working Docker image, GitHub Action, and local install script
 5. **Observable:** Health endpoint, cache stats, structured logs
+
+## Prerequisite Spike
+
+Before full implementation, complete a validation spike (~1-2 days):
+
+1. **S3 API surface capture:** Run sccache against a request-logging Bun server to empirically capture all S3 operations used by sccache/OpenDAL (validates multipart assumption and catches any additional operations).
+2. **Shelby SDK validation:** Verify `@shelby-protocol/sdk` supports: `upload()`, `download()`, existence check (head or equivalent), and confirm blob size limits.
+3. **Shelby testnet throughput:** Test bulk upload performance (100 x 5MB blobs) to establish baseline latency and identify rate limits.
 
 ## Open Questions
 
 1. **Shelby testnet rate limits:** Need to verify testnet throughput limits for bulk uploads during cold cache population
 2. **Blob size limits:** Verify max blob size on Shelby testnet (sccache artifacts are typically 1-50MB)
-3. **S3 multipart upload:** sccache may use multipart for large artifacts — need to verify and potentially implement
+3. **Shelby SDK head operation:** Confirm whether the SDK has a native blob existence check or if it needs to be emulated
 4. **Shelby API key provisioning:** Document how team members get testnet API keys

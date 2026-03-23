@@ -1,0 +1,18 @@
+services:
+  shelby-cache-proxy:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "9000:9000"
+    volumes:
+      - cache-data:/data/cache
+    environment:
+      - APTOS_PRIVATE_KEY=${APTOS_PRIVATE_KEY}
+      - SHELBY_API_KEY=${SHELBY_API_KEY}
+      - SHELBY_CACHE_CACHE_MAX_SIZE_GB=50
+    restart: unless-stopped
+
+volumes:
+  cache-data:
+    driver: local

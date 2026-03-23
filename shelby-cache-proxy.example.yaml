@@ -1,0 +1,35 @@
+# shelby-cache-proxy.yaml
+server:
+  port: 9000
+  host: 0.0.0.0
+
+shelby:
+  network: testnet
+  api_key: ${SHELBY_API_KEY}
+  aptos_private_key: ${APTOS_PRIVATE_KEY}
+  blob_expiry_days: 30
+
+s3:
+  access_key: AKIAIOSFODNN7EXAMPLE
+  secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  region: shelbyland
+  key_prefix: sccache/v1
+
+cache:
+  enabled: true
+  dir: ~/.shelby-cache/objects
+  staging_dir: ~/.shelby-cache/staging   # temp dir for multipart upload assembly
+  max_size_gb: 10
+  ttl_days: 7
+  cleanup_interval_minutes: 10
+
+dedup:
+  enabled: true
+  db_path: ~/.shelby-cache/dedup.db
+  bloom_filter_expected_items: 1000000
+  bloom_filter_fpr: 0.01
+  renewal_threshold_days: 5              # renew blobs within this many days of expiry
+
+logging:
+  level: info   # debug | info | warn | error
+  format: json  # json | text

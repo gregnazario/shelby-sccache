@@ -1,0 +1,19 @@
+{
+  "name": "shelby-sccache",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "^1.3.11"
+  },
+  "peerDependencies": {
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@aptos-labs/ts-sdk": "^6.2.0",
+    "@shelby-protocol/sdk": "^0.2.4",
+    "@smithy/signature-v4": "^5.3.12",
+    "hono": "^4.12.8",
+    "yaml": "^2.8.3"
+  }
+}

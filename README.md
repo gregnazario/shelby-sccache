@@ -138,4 +138,4 @@ SHELBY_CACHE_LOGGING_LEVEL=debug bun run src/cli/index.ts start
 
 ## License
 
-By Greg Nazario.
+Apache-2.0. Copyright 2026 Greg Nazario.

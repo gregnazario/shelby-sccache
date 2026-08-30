@@ -10,8 +10,8 @@ shelby:
   blob_expiry_days: 30
 
 s3:
-  access_key: AKIAIOSFODNN7EXAMPLE
-  secret_key: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  access_key: CHANGE_ME_ACCESS_KEY_ID
+  secret_key: CHANGE_ME_SECRET_ACCESS_KEY
   region: shelbyland
   key_prefix: sccache/v1
 

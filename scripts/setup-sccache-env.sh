@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # scripts/setup-sccache-env.sh
-# Source this file to configure sccache for Shelby
+# Source this file to configure sccache for Shelby.
+#
+# POSIX sh compatible: can be sourced from bash, dash, or /bin/sh (e.g.
+# `RUN . scripts/setup-sccache-env.sh` in a Dockerfile or an sh-based Make
+# recipe), and can also be executed directly.
 
 # Validate credentials BEFORE exporting anything, so a failed source leaves
 # the caller's shell untouched. All missing variables are reported at once.
-missing=()
-[ -n "${AWS_ACCESS_KEY_ID:-}" ] || missing+=(AWS_ACCESS_KEY_ID)
-[ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || missing+=(AWS_SECRET_ACCESS_KEY)
-if [ "${#missing[@]}" -gt 0 ]; then
-  printf 'setup-sccache-env.sh: required environment variable(s) not set: %s\n' "${missing[*]}" >&2
-  if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-    exit 1
-  else
-    return 1
-  fi
+# The helper variable is underscore-prefixed to resist collisions with the
+# caller's own variables and is unset before returning, so nothing leaks.
+_sccache_missing_vars=""
+[ -n "${AWS_ACCESS_KEY_ID:-}" ] || _sccache_missing_vars="$_sccache_missing_vars AWS_ACCESS_KEY_ID"
+[ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || _sccache_missing_vars="$_sccache_missing_vars AWS_SECRET_ACCESS_KEY"
+if [ -n "$_sccache_missing_vars" ]; then
+  printf 'setup-sccache-env.sh: required environment variable(s) not set:%s\n' "$_sccache_missing_vars" >&2
+  unset _sccache_missing_vars
+  # `return` only works when sourced; fall back to `exit` when executed.
+  if (return 0) 2>/dev/null; then return 1; else exit 1; fi
 fi
+unset _sccache_missing_vars
 
 export SCCACHE_BUCKET="${SCCACHE_BUCKET:-shelby}"
 export SCCACHE_ENDPOINT="${SCCACHE_ENDPOINT:-http://localhost:9000}"
